@@ -70,6 +70,7 @@ import java.util.jar.JarInputStream;
 import java.util.regex.Pattern;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -182,6 +183,8 @@ public class SBOMApplication implements IApplication {
 
 	private static final String METADATA_ARTIFACT = "metadata";
 
+	private static boolean queryCentral;
+
 	private static boolean isMetadata(IArtifactDescriptor artifactDescriptor) {
 		return METADATA_ARTIFACT.equals(artifactDescriptor.getArtifactKey().getClassifier());
 	}
@@ -192,6 +195,7 @@ public class SBOMApplication implements IApplication {
 		var sbomGeneratorResults = new ArrayList<SBOMGenerator.Result>();
 		var installationsFolder = getArgument("-installations", args, null);
 		var verbose = getArgument("-verbose", args);
+		SBOMApplication.queryCentral = getArgument("-centralsearch", args);
 		if (installationsFolder != null) {
 			var installationPattern = Pattern
 					.compile(getArgument("-installation-pattern", args, ".*\\.(zip|tar|tar.gz)$"));
@@ -696,7 +700,13 @@ public class SBOMApplication implements IApplication {
 
 			generateXML(bom);
 			generateJson(bom);
-
+			System.out.println("Found by P2 properties: " + foundByP2);
+			System.out.println("Found by maven jar:     " + foundByJar);
+			System.out.println("Found by hashcode:      " + foundByHashCode);
+			System.out.println("Without Maven infos:    " + missed.size());
+			for (String m : missed) {
+				System.out.println("\t" + m);
+			}
 			return Status.OK_STATUS;
 		}
 
@@ -967,7 +977,7 @@ public class SBOMApplication implements IApplication {
 
 		private void setPurl(Component component, IInstallableUnit iu, IArtifactDescriptor artifactDescriptor,
 				byte[] bytes) {
-			var mavenDescriptor = MavenDescriptor.create(iu, artifactDescriptor, bytes);
+			var mavenDescriptor = MavenDescriptor.create(iu, artifactDescriptor, bytes, contentHandler);
 			if (mavenDescriptor != null && !mavenDescriptor.isSnapshot()) {
 				try {
 					// Document xmlContent =
@@ -1064,7 +1074,7 @@ public class SBOMApplication implements IApplication {
 				gatherLicencesFromJar(component, bytes, licenseToName);
 			}
 
-			var mavenDescriptor = MavenDescriptor.create(iu, artifactDescriptor, bytes);
+			var mavenDescriptor = MavenDescriptor.create(iu, artifactDescriptor, bytes, contentHandler);
 			if (mavenDescriptor != null && !mavenDescriptor.isSnapshot()) {
 				try {
 					var content = contentHandler.getContent(mavenDescriptor.toPOMURI());
@@ -1722,12 +1732,20 @@ public class SBOMApplication implements IApplication {
 		}
 	}
 
+	static int foundByP2;
+	static int foundByJar;
+	static Set<String> missed = new TreeSet<>();
+	static int foundByHashCode;
+
 	record MavenDescriptor(String groupId, String artifactId, String version, String classifier, String type) {
-		public static MavenDescriptor create(IInstallableUnit iu, IArtifactDescriptor artifactDescriptor,
-				byte[] bytes) {
+		public static MavenDescriptor create(IInstallableUnit iu, IArtifactDescriptor artifactDescriptor, byte[] bytes,
+				ContentHandler contentHandler) {
 			var mavenDescriptor = create(artifactDescriptor.getProperties());
 			if (mavenDescriptor == null) {
 				mavenDescriptor = create(iu.getProperties());
+			}
+			if (mavenDescriptor != null) {
+				foundByP2++;
 			}
 			if (mavenDescriptor == null && !isMetadata(artifactDescriptor)) {
 				try (var stream = new JarInputStream(new ByteArrayInputStream(bytes))) {
@@ -1741,6 +1759,7 @@ public class SBOMApplication implements IApplication {
 							var groupId = properties.getProperty("groupId");
 							var version = properties.getProperty("version");
 							if (artifactId != null && groupId != null && version != null) {
+								foundByJar++;
 								return new MavenDescriptor(groupId, artifactId, version, null, "jar");
 							}
 						}
@@ -1748,7 +1767,34 @@ public class SBOMApplication implements IApplication {
 				} catch (IOException e) {
 					// If anything goes wrong we can not do much more at this stage...
 				}
+				if (queryCentral) {
+					// This is not the end we can try to query maven entral
+					try {
+						var digest = MessageDigest.getInstance("SHA-1");
+						digest.update(bytes);
+						var digestBytes = digest.digest();
+						var sha1Hash = IntStream.range(0, digestBytes.length)
+								.mapToObj(i -> String.format("%02X", digestBytes[i])).collect(Collectors.joining());
+						var queryResult = contentHandler.getContent(
+								URI.create("https://search.maven.org/solrsearch/select?q=1:+" + sha1Hash + "&wt=json"));
+						var jsonObject = new JSONObject(queryResult);
+						if (jsonObject.has("response")) {
+							var response = jsonObject.getJSONObject("response");
+							if (response.has("numFound") && response.getInt("numFound") == 1) {
+								var coordinates = response.getJSONArray("docs").getJSONObject(0);
+								foundByHashCode++;
+								return new MavenDescriptor(coordinates.getString("g"), coordinates.getString("a"),
+										coordinates.getString("v"), null, coordinates.getString("p"));
+							}
+						}
+					} catch (Exception e) {
+						// If anything goes wrong here, we can not do much more ...
+					}
+				}
 				// System.err.println("###" + artifactDescriptor);
+			}
+			if (mavenDescriptor == null && !isMetadata(artifactDescriptor)) {
+				missed.add(String.valueOf(artifactDescriptor.getArtifactKey().toExternalForm()));
 			}
 			return mavenDescriptor;
 		}

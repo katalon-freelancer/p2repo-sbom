@@ -1,14 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?pde version="3.5"?>
 
-<product
-  name="CBI p2 SBOM"
-  uid="org.eclipse.cbi.p2repo.sbom.cli.product"
-  id="org.eclipse.cbi.p2repo.sbom.cli.headless.product"
-  application="org.eclipse.cbi.p2repo.sbom.generator"
-  version="0.1.0.qualifier"
-  useFeatures="true"
-  includeLaunchers="true">
+<product name="CBI p2 SBOM" uid="org.eclipse.cbi.p2repo.sbom.cli.product" application="org.eclipse.cbi.p2repo.sbom.generator" version="0.1.0.qualifier" type="features" includeLaunchers="true" autoIncludeRequirements="true">
 
    <configIni use="default">
    </configIni>
@@ -26,7 +19,6 @@
    <windowImages/>
 
    <launcher name="cbi-sbom">
-      <solaris/>
       <win useIco="false">
          <bmp/>
       </win>
