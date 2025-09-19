@@ -56,6 +56,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -189,6 +190,8 @@ public class SBOMApplication implements IApplication {
 	private static boolean isMetadata(IArtifactDescriptor artifactDescriptor) {
 		return METADATA_ARTIFACT.equals(artifactDescriptor.getArtifactKey().getClassifier());
 	}
+
+	private static final Set<IArtifactKey> notMapped = new HashSet<>();
 
 	@Override
 	public Object start(IApplicationContext context) throws Exception {
@@ -706,7 +709,13 @@ public class SBOMApplication implements IApplication {
 
 			generateXML(bom);
 			generateJson(bom);
-
+			System.out.println("Unmapped keys: " + notMapped.size());
+			for (String id : notMapped.stream().map(IArtifactKey::getId).sorted().toList()) {
+				if (id.contains(".katalon.")) {
+					continue;
+				}
+				System.out.println("  " + id);
+			}
 			return Status.OK_STATUS;
 		}
 
@@ -1056,14 +1065,16 @@ public class SBOMApplication implements IApplication {
 
 		private URI getArtifactLocation(IArtifactDescriptor artifactDescriptor) {
 			// First see if there are any explicitly configured source repositories
+			var key = artifactDescriptor.getArtifactKey();
 			if (!p2ArtifactSourceRepositories.isEmpty()) {
 				loadSourceRepositories();
 				for (ArtifactSourceRepository repository : artifactSourceRepositories) {
-					if (repository.contains(artifactDescriptor.getArtifactKey())) {
+					if (repository.contains(artifactDescriptor)) {
 						return repository.uri();
 					}
 				}
 			}
+			notMapped.add(key);
 			// if not use where we have fetched this from
 			return artifactDescriptor.getRepository().getLocation();
 		}
@@ -2413,8 +2424,26 @@ public class SBOMApplication implements IApplication {
 
 	private static final record ArtifactSourceRepository(URI uri, IArtifactRepository repository) {
 
-		public boolean contains(IArtifactKey artifactKey) {
-			return repository.contains(artifactKey);
+		public boolean contains(IArtifactDescriptor otherDescriptor) {
+			var descriptors = repository.getArtifactDescriptors(otherDescriptor.getArtifactKey());
+			if (descriptors.length > 0) {
+				var otherProperties = otherDescriptor.getProperties();
+				for (IArtifactDescriptor descriptor : descriptors) {
+					var thisProperties = descriptor.getProperties();
+					// we want at least one checksum to match!
+					if (thisProperties.keySet().stream().filter(key -> key.startsWith("download.checksum."))
+							.anyMatch(key -> Objects.equals(thisProperties.get(key), otherProperties.get(key)))) {
+						return true;
+					}
+					// not so good but better than nothing, if size is equal... e.g for local
+					// artifacts we only have size as P2 do not store more properties sadly
+					if (Objects.equals(thisProperties.get("download.size"), otherProperties.get("download.size"))) {
+						return true;
+					}
+				}
+				System.out.println("Not found??");
+			}
+			return false;
 		}
 
 	}
