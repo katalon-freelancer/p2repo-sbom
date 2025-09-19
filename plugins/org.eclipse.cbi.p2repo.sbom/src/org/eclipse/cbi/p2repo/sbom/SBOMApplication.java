@@ -70,7 +70,6 @@ import java.util.jar.JarInputStream;
 import java.util.regex.Pattern;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -132,7 +131,9 @@ import org.eclipse.equinox.p2.query.QueryUtil;
 import org.eclipse.equinox.p2.repository.ICompositeRepository;
 import org.eclipse.equinox.p2.repository.IRepository;
 import org.eclipse.equinox.p2.repository.IRepositoryManager;
+import org.eclipse.equinox.p2.repository.IRepositoryReference;
 import org.eclipse.equinox.p2.repository.artifact.IArtifactDescriptor;
+import org.eclipse.equinox.p2.repository.artifact.IArtifactRepository;
 import org.eclipse.equinox.p2.repository.artifact.IArtifactRepositoryManager;
 import org.eclipse.equinox.p2.repository.artifact.spi.ArtifactDescriptor;
 import org.eclipse.equinox.p2.repository.metadata.IMetadataRepository;
@@ -395,6 +396,8 @@ public class SBOMApplication implements IApplication {
 
 		private final List<URI> artifactRepositoryURIs = new ArrayList<>();
 
+		private List<ArtifactSourceRepository> artifactSourceRepositories;
+
 		private final List<IInstallableUnit> inclusiveContextIUs = new ArrayList<>();
 
 		private final List<IInstallableUnit> exclusiveContextIUs = new ArrayList<>();
@@ -424,6 +427,8 @@ public class SBOMApplication implements IApplication {
 		private IMetadataRepositoryManager metadataRepositoryManager;
 
 		private IArtifactRepositoryManager artifactRepositoryManager;
+
+		private List<String> p2ArtifactSourceRepositories;
 
 		private SBOMGenerator(List<String> args) throws Exception {
 			contentHandler = new ContentHandler(getArgument("-cache", args, null));
@@ -463,6 +468,7 @@ public class SBOMApplication implements IApplication {
 			jsonOutput = getArgument("-json-output", args, null);
 			json = getArgument("-json", args);
 			xml = getArgument("-xml", args) || !json && xmlOutput == null && jsonOutput == null;
+			p2ArtifactSourceRepositories = getArguments("-p2sources", args, List.of());
 		}
 
 		private List<Path> getOutputs() {
@@ -702,6 +708,38 @@ public class SBOMApplication implements IApplication {
 			generateJson(bom);
 
 			return Status.OK_STATUS;
+		}
+
+		private void loadArtifactSource(URI location, URI referenced, Set<URI> loaded) {
+			if (loaded.add(location)) {
+				try {
+					var artifactManager = getArtifactRepositoryManager();
+					var contains = artifactManager.contains(location);
+					var repository = artifactManager.loadRepository(location, new NullProgressMonitor());
+					artifactSourceRepositories
+							.add(new ArtifactSourceRepository(referenced == null ? location : referenced, repository));
+					if (!contains) {
+						artifactManager.removeRepository(location);
+					}
+					var metadataManager = getMetadataRepositoryManager();
+					var references = metadataManager.loadRepository(location, new NullProgressMonitor())
+							.getReferences();
+					contains = metadataManager.contains(location);
+					for (IRepositoryReference reference : references) {
+						if (reference.isEnabled()) {
+							loadArtifactSource(reference.getLocation(), location, loaded);
+						}
+					}
+					if (!contains) {
+						metadataManager.removeRepository(location);
+					}
+				} catch (Exception e) {
+					if (referenced == null) {
+						System.err
+								.println("Can't load p2 source repository: " + location + " it will be ignored: " + e);
+					}
+				}
+			}
 		}
 
 		private void buildArtifactMappings() {
@@ -1008,12 +1046,35 @@ public class SBOMApplication implements IApplication {
 
 			var location = getRedirectedURI(
 					isMetadata(artifactDescriptor) ? URI.create(artifactDescriptor.getProperty("location"))
-							: artifactDescriptor.getRepository().getLocation());
+							: getArtifactLocation(artifactDescriptor));
 			var artifactKey = artifactDescriptor.getArtifactKey();
 			var encodedLocation = urlEncodeQueryParameter(location.toString());
 			var purl = "pkg:p2/" + artifactKey.getId() + "@" + artifactKey.getVersion() + "?classifier="
 					+ artifactKey.getClassifier() + "&location=" + encodedLocation;
 			component.setPurl(purl);
+		}
+
+		private URI getArtifactLocation(IArtifactDescriptor artifactDescriptor) {
+			// First see if there are any explicitly configured source repositories
+			if (!p2ArtifactSourceRepositories.isEmpty()) {
+				loadSourceRepositories();
+				for (ArtifactSourceRepository repository : artifactSourceRepositories) {
+					if (repository.contains(artifactDescriptor.getArtifactKey())) {
+						return repository.uri();
+					}
+				}
+			}
+			// if not use where we have fetched this from
+			return artifactDescriptor.getRepository().getLocation();
+		}
+
+		private synchronized void loadSourceRepositories() {
+			if (artifactSourceRepositories == null) {
+				artifactSourceRepositories = new ArrayList<>();
+				for (String srcRepoUri : p2ArtifactSourceRepositories) {
+					loadArtifactSource(URI.create(srcRepoUri), null, new HashSet<>());
+				}
+			}
 		}
 
 		private URI getRedirectedURI(URI location) {
@@ -2348,5 +2409,13 @@ public class SBOMApplication implements IApplication {
 
 			return uriRedirections;
 		}
+	}
+
+	private static final record ArtifactSourceRepository(URI uri, IArtifactRepository repository) {
+
+		public boolean contains(IArtifactKey artifactKey) {
+			return repository.contains(artifactKey);
+		}
+
 	}
 }
