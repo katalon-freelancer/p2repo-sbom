@@ -29,6 +29,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.StringReader;
 import java.net.URI;
 import java.net.URLDecoder;
@@ -58,6 +59,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -108,7 +110,6 @@ import org.cyclonedx.model.Property;
 import org.cyclonedx.model.component.data.ComponentData;
 import org.cyclonedx.model.component.data.ComponentData.ComponentDataType;
 import org.cyclonedx.model.component.data.Content;
-import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.MultiStatus;
@@ -1325,7 +1326,8 @@ public class SBOMApplication implements IApplication {
 			var out = new ByteArrayOutputStream();
 			var status = repository.getRawArtifact(artifactDescriptor, out, new NullProgressMonitor());
 			if (!status.isOK()) {
-				throw new RuntimeException(new CoreException(status));
+				// throw new RuntimeException(new CoreException(status));
+				return new byte[0];
 			}
 			return out.toByteArray();
 		}
@@ -2303,9 +2305,12 @@ public class SBOMApplication implements IApplication {
 
 			private final int statusCode;
 
+			private Optional<String> retryAfter;
+
 			public ContentHandlerException(HttpResponse<?> response) {
 				super("status code " + response.statusCode() + " -> " + response.uri());
 				this.statusCode = response.statusCode();
+				retryAfter = response.headers().firstValue("Retry-After");
 			}
 
 			public ContentHandlerException(int statusCode, URI uri) {
@@ -2315,6 +2320,17 @@ public class SBOMApplication implements IApplication {
 
 			public int statusCode() {
 				return statusCode;
+			}
+
+			public int getRetryAfter() {
+				try {
+					if (retryAfter.isPresent()) {
+						return Integer.parseInt(retryAfter.get());
+					}
+				} catch (NumberFormatException e) {
+
+				}
+				return 5; // default 5 seconds
 			}
 		}
 
@@ -2457,21 +2473,42 @@ public class SBOMApplication implements IApplication {
 			if (Files.isRegularFile(path404) && !isCacheExpired(path404)) {
 				throw new ContentHandlerException(404, uri);
 			}
+			var retry = 5;
+			while (!Thread.currentThread().isInterrupted()) {
+				try {
+					Files.createDirectories(path.getParent());
+					var content = basicGetContent(uri, bodyHandler);
+					writer.write(path, content);
+					return content;
+				} catch (ContentHandlerException e) {
+					var statusCode = e.statusCode();
+					if (statusCode == 404) {
+						Files.createDirectories(path404.getParent());
+						Files.writeString(path404, "");
+					}
+					if (retry-- > 0 && retryRequest(statusCode)) {
+						try {
+							var retryAfter = e.getRetryAfter();
+							System.err.println("## Request to " + uri + " failed, retry again after " + retryAfter
+									+ " seconds [" + retry + " retries left]");
+							TimeUnit.SECONDS.sleep(retryAfter);
+						} catch (InterruptedException e1) {
+							throw new InterruptedIOException();
+						}
+						continue;
+					}
+					throw e;
 
-			try {
-				Files.createDirectories(path.getParent());
-				var content = basicGetContent(uri, bodyHandler);
-				writer.write(path, content);
-				return content;
-			} catch (ContentHandlerException e) {
-				if (e.statusCode() == 404) {
-					Files.createDirectories(path404.getParent());
-					Files.writeString(path404, "");
+				} catch (InterruptedException e) {
+					throw new InterruptedIOException();
 				}
-				throw e;
-			} catch (InterruptedException e) {
-				throw new IOException(e);
 			}
+			throw new InterruptedIOException();
+		}
+
+		private boolean retryRequest(int statusCode) {
+			return statusCode == 429 /* To many Requests */ || statusCode == 503 /* Service unavailable */
+					|| statusCode == 502 /* Bad Gateway */ || statusCode == 504 /* Gateway timeout */;
 		}
 
 		public Document getXMLContent(URI uri) throws IOException {
